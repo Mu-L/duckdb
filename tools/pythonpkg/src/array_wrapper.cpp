@@ -85,7 +85,7 @@ struct DateConvert {
 struct IntervalConvert {
 	template <class DUCKDB_T, class NUMPY_T>
 	static int64_t ConvertValue(interval_t val) {
-		return Interval::GetMilli(val);
+		return Interval::GetNanoseconds(val);
 	}
 
 	template <class NUMPY_T>
@@ -312,7 +312,7 @@ static bool ConvertDecimalInternal(idx_t target_offset, data_ptr_t target_data, 
 
 static bool ConvertDecimal(const LogicalType &decimal_type, idx_t target_offset, data_ptr_t target_data,
                            bool *target_mask, VectorData &idata, idx_t count) {
-	auto dec_scale = decimal_type.scale();
+	auto dec_scale = DecimalType::GetScale(decimal_type);
 	double division = pow(10, dec_scale);
 	switch (decimal_type.InternalType()) {
 	case PhysicalType::INT16:

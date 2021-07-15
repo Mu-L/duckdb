@@ -80,7 +80,7 @@ class TestArrowIntegration(object):
 
         duckdb_conn.execute("CREATE TABLE test (a DECIMAL(4,2), b DECIMAL(9,2), c DECIMAL (18,2), d DECIMAL (30,2))")
 
-        duckdb_conn.execute("INSERT INTO  test VALUES (1.11,1.11,1.11,1.11),(NULL,NULL,NULL,NULL),(2.11,103.21,99999999999999.21,99999999999999999999.21)")
+        duckdb_conn.execute("INSERT INTO  test VALUES (1.11,1.11,1.11,1.11),(NULL,NULL,NULL,NULL)")
 
         true_result = duckdb_conn.execute("SELECT sum(a), sum(b), sum(c),sum(d) from test").fetchall()
 
@@ -108,3 +108,27 @@ class TestArrowIntegration(object):
         duckdb_conn.from_arrow_table(arrow_tbl).create("bigdecimal")
         result = duckdb_conn.execute('select * from bigdecimal')
         assert (result.fetchone()[0] == 9999999999999999999999999999999999)
+
+    def test_strings_roundtrip(self,duckdb_cursor):
+        if not can_run:
+            return
+
+        duckdb_conn = duckdb.connect()
+
+        duckdb_conn.execute("CREATE TABLE test (a varchar)")
+
+        # Test Small, Null and Very Big String
+        for i in range (0,1000):
+            duckdb_conn.execute("INSERT INTO  test VALUES ('Matt Damon'),(NULL), ('Jeffffreeeey Jeeeeef Baaaaaaazos'), ('X-Content-Type-Options')")
+
+        true_result = duckdb_conn.execute("SELECT * from test").fetchall()
+
+        duck_tbl = duckdb_conn.table("test")
+
+        duck_from_arrow = duckdb_conn.from_arrow_table(duck_tbl.arrow())
+
+        duck_from_arrow.create("testarrow")
+
+        arrow_result = duckdb_conn.execute("SELECT * from testarrow").fetchall()
+
+        assert(arrow_result == true_result)

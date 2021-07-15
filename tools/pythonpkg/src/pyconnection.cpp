@@ -43,7 +43,7 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	    .def("fetchdf", &DuckDBPyConnection::FetchDF, "Fetch a result as Data.Frame following execute()")
 	    .def("fetch_df", &DuckDBPyConnection::FetchDF, "Fetch a result as Data.Frame following execute()")
 	    .def("fetch_df_chunk", &DuckDBPyConnection::FetchDFChunk,
-	         "Fetch a chunk of the result as Data.Frame following execute()")
+	         "Fetch a chunk of the result as Data.Frame following execute()", py::arg("vectors_per_chunk") = 1)
 	    .def("df", &DuckDBPyConnection::FetchDF, "Fetch a result as Data.Frame following execute()")
 	    .def("fetch_arrow_table", &DuckDBPyConnection::FetchArrow, "Fetch a result as Arrow table following execute()")
 	    .def("arrow", &DuckDBPyConnection::FetchArrow, "Fetch a result as Arrow table following execute()")
@@ -162,13 +162,14 @@ DuckDBPyConnection *DuckDBPyConnection::RegisterDF(const string &name, py::objec
 	return this;
 }
 
-DuckDBPyConnection *DuckDBPyConnection::RegisterArrow(const string &name, py::object table,
+DuckDBPyConnection *DuckDBPyConnection::RegisterArrow(const string &name, py::object &table,
                                                       const idx_t rows_per_tuple) {
 	if (!connection) {
 		throw std::runtime_error("connection closed");
 	}
-	if (table.is_none() || string(py::str(table.get_type().attr("__name__"))) != "Table") {
-		throw std::runtime_error("Only arrow tables supported");
+	auto py_object_type = string(py::str(table.get_type().attr("__name__")));
+	if (table.is_none() || (py_object_type != "Table" && py_object_type != "FileSystemDataset")) {
+		throw std::runtime_error("Only arrow tables/datasets are supported");
 	}
 	auto stream_factory = make_unique<PythonTableArrowArrayStreamFactory>(table.ptr());
 
@@ -178,7 +179,7 @@ DuckDBPyConnection *DuckDBPyConnection::RegisterArrow(const string &name, py::ob
 	                    {Value::POINTER((uintptr_t)stream_factory.get()),
 	                     Value::POINTER((uintptr_t)stream_factory_produce), Value::UBIGINT(rows_per_tuple)})
 	    ->CreateView(name, true, true);
-	auto object = make_unique<RegisteredArrow>(move(stream_factory), table);
+	auto object = make_unique<RegisteredArrow>(move(stream_factory), move(table));
 	registered_objects[name] = move(object);
 	return this;
 }
@@ -271,9 +272,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrowTable(py::object &tabl
 	py::gil_scoped_acquire acquire;
 
 	// the following is a careful dance around having to depend on pyarrow
-	if (table.is_none() || string(py::str(table.get_type().attr("__name__"))) != "Table") {
-		throw std::runtime_error("Only arrow tables supported");
+	auto py_object_type = string(py::str(table.get_type().attr("__name__")));
+	if (table.is_none() || (py_object_type != "Table" && py_object_type != "FileSystemDataset")) {
+		throw std::runtime_error("Only arrow tables/datasets are supported");
 	}
+
 	string name = "arrow_table_" + GenerateRandomName();
 
 	auto stream_factory = make_unique<PythonTableArrowArrayStreamFactory>(table.ptr());
@@ -320,7 +323,7 @@ DuckDBPyConnection *DuckDBPyConnection::Rollback() {
 py::object DuckDBPyConnection::GetAttr(const py::str &key) {
 	if (key.cast<string>() == "description") {
 		if (!result) {
-			throw std::runtime_error("no open result set");
+			return py::none();
 		}
 		return result->Description();
 	}
@@ -374,11 +377,11 @@ py::object DuckDBPyConnection::FetchDF() {
 	return result->FetchDF();
 }
 
-py::object DuckDBPyConnection::FetchDFChunk() const {
+py::object DuckDBPyConnection::FetchDFChunk(const idx_t vectors_per_chunk) const {
 	if (!result) {
 		throw std::runtime_error("no open result set");
 	}
-	return result->FetchDFChunk();
+	return result->FetchDFChunk(vectors_per_chunk);
 }
 
 py::object DuckDBPyConnection::FetchArrow() {
@@ -399,7 +402,7 @@ static unique_ptr<TableFunctionRef> TryPandasReplacement(py::dict &dict, py::str
 	auto table_function = make_unique<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(make_unique<ConstantExpression>(Value::POINTER((uintptr_t)entry.ptr())));
-	table_function->function = make_unique<FunctionExpression>("pandas_scan", children);
+	table_function->function = make_unique<FunctionExpression>("pandas_scan", move(children));
 	return table_function;
 }
 

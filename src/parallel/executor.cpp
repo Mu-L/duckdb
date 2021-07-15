@@ -39,6 +39,9 @@ void Executor::Initialize(PhysicalOperator *plan) {
 
 		// schedule pipelines that do not have dependents
 		for (auto &pipeline : pipelines) {
+#ifdef DEBUG
+			D_ASSERT(!pipeline->ToString().empty());
+#endif
 			if (!pipeline->HasDependencies()) {
 				pipeline->Schedule();
 			}
@@ -52,8 +55,38 @@ void Executor::Initialize(PhysicalOperator *plan) {
 			task->Execute();
 			task.reset();
 		}
+		string exception;
+		if (!GetError(exception)) {
+			// no exceptions: continue
+			continue;
+		}
+
+		// an exception has occurred executing one of the pipelines
+		// we need to wait until all threads are finished
+		// we do this by creating weak pointers to all pipelines
+		// then clearing our references to the pipelines
+		// and waiting until all pipelines have been destroyed
+		vector<weak_ptr<Pipeline>> weak_references;
+		{
+			lock_guard<mutex> elock(executor_lock);
+			weak_references.reserve(pipelines.size());
+			for (auto &pipeline : pipelines) {
+				weak_references.push_back(weak_ptr<Pipeline>(pipeline));
+			}
+			pipelines.clear();
+		}
+		for (auto &weak_ref : weak_references) {
+			while (true) {
+				auto weak = weak_ref.lock();
+				if (!weak) {
+					break;
+				}
+			}
+		}
+		throw Exception(exception);
 	}
 
+	lock_guard<mutex> elock(executor_lock);
 	pipelines.clear();
 	if (!exceptions.empty()) {
 		// an exception has occurred executing one of the pipelines
@@ -62,6 +95,7 @@ void Executor::Initialize(PhysicalOperator *plan) {
 }
 
 void Executor::Reset() {
+	lock_guard<mutex> elock(executor_lock);
 	delim_join_dependencies.clear();
 	recursive_cte = nullptr;
 	physical_plan = nullptr;
@@ -75,12 +109,12 @@ void Executor::Reset() {
 void Executor::BuildPipelines(PhysicalOperator *op, Pipeline *parent) {
 	if (op->IsSink()) {
 		// operator is a sink, build a pipeline
-		auto pipeline = make_unique<Pipeline>(*this, *producer);
+		auto pipeline = make_shared<Pipeline>(*this, *producer);
 		pipeline->sink = (PhysicalSink *)op;
 		pipeline->sink_state = pipeline->sink->GetGlobalState(context);
 		if (parent) {
 			// the parent is dependent on this pipeline to complete
-			parent->AddDependency(pipeline.get());
+			parent->AddDependency(pipeline);
 		}
 		switch (op->type) {
 		case PhysicalOperatorType::CREATE_TABLE_AS:
@@ -119,7 +153,8 @@ void Executor::BuildPipelines(PhysicalOperator *op, Pipeline *parent) {
 		}
 		// recurse into the pipeline child
 		BuildPipelines(pipeline->child, pipeline.get());
-		for (auto &dependency : pipeline->GetDependencies()) {
+		for (auto &entry : pipeline->dependencies) {
+			auto dependency = entry.second.lock();
 			auto dependency_cte = dependency->GetRecursiveCTE();
 			if (dependency_cte) {
 				pipeline->SetRecursiveCTE(dependency_cte);
@@ -155,7 +190,8 @@ void Executor::BuildPipelines(PhysicalOperator *op, Pipeline *parent) {
 			// this chunk scan introduces a dependency to the current pipeline
 			// namely a dependency on the duplicate elimination pipeline to finish
 			D_ASSERT(parent);
-			parent->AddDependency(entry->second);
+			auto delim_dependency = entry->second->shared_from_this();
+			parent->AddDependency(delim_dependency);
 			break;
 		}
 		case PhysicalOperatorType::EXECUTE: {
@@ -177,7 +213,7 @@ void Executor::BuildPipelines(PhysicalOperator *op, Pipeline *parent) {
 			BuildPipelines(op->children[1].get(), parent);
 			// re-order the pipelines such that they are executed in the correct order of dependencies
 			for (idx_t i = 0; i < cte_node.pipelines.size(); i++) {
-				auto &deps = cte_node.pipelines[i]->GetDependencies();
+				auto &deps = cte_node.pipelines[i]->dependencies;
 				for (idx_t j = i + 1; j < cte_node.pipelines.size(); j++) {
 					if (deps.find(cte_node.pipelines[j].get()) != deps.end()) {
 						// pipeline "i" depends on pipeline "j" but pipeline "i" is scheduled to be executed before
@@ -231,6 +267,15 @@ void Executor::PushError(const string &exception) {
 	exceptions.push_back(exception);
 }
 
+bool Executor::GetError(string &exception) {
+	lock_guard<mutex> elock(executor_lock);
+	if (exceptions.empty()) {
+		return false;
+	}
+	exception = exceptions[0];
+	return true;
+}
+
 void Executor::Flush(ThreadContext &tcontext) {
 	lock_guard<mutex> elock(executor_lock);
 	context.profiler->Flush(tcontext.profiler);
@@ -256,7 +301,7 @@ unique_ptr<DataChunk> Executor::FetchChunk() {
 
 	auto chunk = make_unique<DataChunk>();
 	// run the plan to get the next chunks
-	physical_plan->InitializeChunkEmpty(*chunk);
+	physical_plan->InitializeChunk(*chunk);
 	physical_plan->GetChunk(econtext, *chunk, physical_state.get());
 	physical_plan->FinalizeOperatorState(*physical_state, econtext);
 	context.profiler->Flush(thread.profiler);

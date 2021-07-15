@@ -24,28 +24,11 @@ class ClientContext;
 //! Abstract base class of an entry in the catalog
 class CatalogEntry {
 public:
-	CatalogEntry(CatalogType type, Catalog *catalog, string name)
-	    : type(type), catalog(catalog), set(nullptr), name(name), deleted(false), temporary(false), internal(false),
-	      parent(nullptr) {
-	}
+	CatalogEntry(CatalogType type, Catalog *catalog, string name);
 	virtual ~CatalogEntry();
 
-	virtual unique_ptr<CatalogEntry> AlterEntry(ClientContext &context, AlterInfo *info) {
-		throw CatalogException("Unsupported alter type for catalog entry!");
-	}
-
-	virtual unique_ptr<CatalogEntry> Copy(ClientContext &context) {
-		throw CatalogException("Unsupported copy type for catalog entry!");
-	}
-	//! Sets the CatalogEntry as the new root entry (i.e. the newest entry) - this is called on a rollback to an
-	//! AlterEntry
-	virtual void SetAsRoot() {
-	}
-	//! Convert the catalog entry to a SQL string that can be used to re-construct the catalog entry
-	virtual string ToSQL() {
-		throw CatalogException("Unsupported catalog type for ToSQL()");
-	}
-
+	//! The oid of the entry
+	idx_t oid;
 	//! The type of this catalog entry
 	CatalogType type;
 	//! Reference to the catalog this entry belongs to
@@ -66,5 +49,17 @@ public:
 	unique_ptr<CatalogEntry> child;
 	//! Parent entry (the node that owns this node)
 	CatalogEntry *parent;
+
+public:
+	virtual unique_ptr<CatalogEntry> AlterEntry(ClientContext &context, AlterInfo *info);
+
+	virtual unique_ptr<CatalogEntry> Copy(ClientContext &context);
+
+	//! Sets the CatalogEntry as the new root entry (i.e. the newest entry)
+	// this is called on a rollback to an AlterEntry
+	virtual void SetAsRoot();
+
+	//! Convert the catalog entry to a SQL string that can be used to re-construct the catalog entry
+	virtual string ToSQL();
 };
 } // namespace duckdb

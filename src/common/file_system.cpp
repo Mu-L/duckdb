@@ -1,16 +1,17 @@
 #include "duckdb/common/file_system.hpp"
 
+#include "duckdb/common/checksum.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/gzip_file_system.hpp"
+#include "duckdb/common/pipe_file_system.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/checksum.hpp"
+#include "duckdb/function/scalar/string_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/function/scalar/string_functions.hpp"
-#include "duckdb/common/gzip_file_system.hpp"
 
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 
 #ifndef _WIN32
 #include <dirent.h>
@@ -167,6 +168,18 @@ idx_t FileSystem::GetFilePointer(FileHandle &handle) {
 	return position;
 }
 
+void FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	int fd = ((UnixFileHandle &)handle).fd;
+	int64_t bytes_read = pread(fd, buffer, nr_bytes, location);
+	if (bytes_read == -1) {
+		throw IOException("Could not read from file \"%s\": %s", handle.path, strerror(errno));
+	}
+	if (bytes_read != nr_bytes) {
+		throw IOException("Could not read all bytes from file \"%s\": wanted=%lld read=%lld", handle.path, nr_bytes,
+		                  bytes_read);
+	}
+}
+
 int64_t FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	int fd = ((UnixFileHandle &)handle).fd;
 	int64_t bytes_read = read(fd, buffer, nr_bytes);
@@ -174,6 +187,18 @@ int64_t FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 		throw IOException("Could not read from file \"%s\": %s", handle.path, strerror(errno));
 	}
 	return bytes_read;
+}
+
+void FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	int fd = ((UnixFileHandle &)handle).fd;
+	int64_t bytes_written = pwrite(fd, buffer, nr_bytes, location);
+	if (bytes_written == -1) {
+		throw IOException("Could not write file \"%s\": %s", handle.path, strerror(errno));
+	}
+	if (bytes_written != nr_bytes) {
+		throw IOException("Could not write all bytes to file \"%s\": wanted=%lld wrote=%lld", handle.path, nr_bytes,
+		                  bytes_written);
+	}
 }
 
 int64_t FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -201,6 +226,32 @@ time_t FileSystem::GetLastModifiedTime(FileHandle &handle) {
 		return -1;
 	}
 	return s.st_mtime;
+}
+
+FileType FileSystem::GetFileType(FileHandle &handle) {
+	int fd = ((UnixFileHandle &)handle).fd;
+	struct stat s;
+	if (fstat(fd, &s) == -1) {
+		return FileType::FILE_TYPE_INVALID;
+	}
+	switch (s.st_mode & S_IFMT) {
+	case S_IFBLK:
+		return FileType::FILE_TYPE_BLOCKDEV;
+	case S_IFCHR:
+		return FileType::FILE_TYPE_CHARDEV;
+	case S_IFIFO:
+		return FileType::FILE_TYPE_FIFO;
+	case S_IFDIR:
+		return FileType::FILE_TYPE_DIR;
+	case S_IFLNK:
+		return FileType::FILE_TYPE_LINK;
+	case S_IFREG:
+		return FileType::FILE_TYPE_REGULAR;
+	case S_IFSOCK:
+		return FileType::FILE_TYPE_SOCKET;
+	default:
+		return FileType::FILE_TYPE_INVALID;
+	}
 }
 
 void FileSystem::Truncate(FileHandle &handle, int64_t new_size) {
@@ -378,6 +429,8 @@ string FileSystem::GetWorkingDirectory() {
 }
 #else
 
+constexpr char PIPE_PREFIX[] = "\\\\.\\pipe\\";
+
 // Returns the last Win32 error, in string format. Returns an empty string if there is no error.
 std::string GetLastErrorAsString() {
 	// Get the error message, if any.
@@ -400,7 +453,8 @@ std::string GetLastErrorAsString() {
 
 struct WindowsFileHandle : public FileHandle {
 public:
-	WindowsFileHandle(FileSystem &file_system, string path, HANDLE fd) : FileHandle(file_system, path), fd(fd) {
+	WindowsFileHandle(FileSystem &file_system, string path, HANDLE fd)
+	    : FileHandle(file_system, path), position(0), fd(fd) {
 	}
 	virtual ~WindowsFileHandle() {
 		Close();
@@ -412,6 +466,7 @@ protected:
 	};
 
 public:
+	idx_t position;
 	HANDLE fd;
 };
 
@@ -425,7 +480,7 @@ unique_ptr<FileHandle> FileSystem::OpenFile(const string &path, uint8_t flags, F
 	DWORD desired_access;
 	DWORD share_mode;
 	DWORD creation_disposition = OPEN_EXISTING;
-	DWORD flags_and_attributes = FILE_ATTRIBUTE_NORMAL;
+	DWORD flags_and_attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
 	if (flags & FileFlags::FILE_FLAGS_READ) {
 		desired_access = GENERIC_READ;
 		share_mode = FILE_SHARE_READ;
@@ -454,58 +509,101 @@ unique_ptr<FileHandle> FileSystem::OpenFile(const string &path, uint8_t flags, F
 	}
 	auto handle = make_unique<WindowsFileHandle>(*this, path.c_str(), hFile);
 	if (flags & FileFlags::FILE_FLAGS_APPEND) {
-		SetFilePointer(*handle, GetFileSize(*handle));
+		auto file_size = GetFileSize(*handle);
+		SetFilePointer(*handle, file_size);
 	}
 	return move(handle);
 }
 
 void FileSystem::SetFilePointer(FileHandle &handle, idx_t location) {
-	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
-	LARGE_INTEGER loc;
-	loc.QuadPart = location;
-	auto rc = SetFilePointerEx(hFile, loc, NULL, FILE_BEGIN);
-	if (rc == 0) {
-		auto error = GetLastErrorAsString();
-		throw IOException("Could not seek to location %lld for file \"%s\": %s", location, handle.path, error);
-	}
+	((WindowsFileHandle &)handle).position = location;
 }
 
 idx_t FileSystem::GetFilePointer(FileHandle &handle) {
+	return ((WindowsFileHandle &)handle).position;
+}
+
+void FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
-	LARGE_INTEGER ret;
-
-	LARGE_INTEGER loc;
-	loc.QuadPart = 0;
-
-	auto rc = SetFilePointerEx(hFile, loc, &ret, FILE_CURRENT);
+	DWORD bytes_read;
+	OVERLAPPED ov = {};
+	ov.Internal = 0;
+	ov.InternalHigh = 0;
+	ov.Offset = location & 0xFFFFFFFF;
+	ov.OffsetHigh = location >> 32;
+	ov.hEvent = 0;
+	ReadFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+	auto rc = GetOverlappedResult(hFile, &ov, &bytes_read, true);
 	if (rc == 0) {
 		auto error = GetLastErrorAsString();
-		throw IOException("Could not get file pointer for file \"%s\": %s", handle.path, error);
+		throw IOException("Could not read file \"%s\": %s", handle.path, error);
 	}
-
-	return ret.QuadPart;
+	if (bytes_read != nr_bytes) {
+		throw IOException("Could not read all bytes from file \"%s\": wanted=%lld read=%lld", handle.path, nr_bytes,
+		                  bytes_read);
+	}
 }
 
 int64_t FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
 	DWORD bytes_read;
-	auto rc = ReadFile(hFile, buffer, (DWORD)nr_bytes, &bytes_read, NULL);
+	auto &pos = ((WindowsFileHandle &)handle).position;
+	OVERLAPPED ov = {};
+	ov.Internal = 0;
+	ov.InternalHigh = 0;
+	ov.Offset = pos & 0xFFFFFFFF;
+	ov.OffsetHigh = pos >> 32;
+	ov.hEvent = 0;
+	auto n = std::min<idx_t>(std::max<idx_t>(GetFileSize(handle), pos) - pos, nr_bytes);
+	ReadFile(hFile, buffer, (DWORD)n, NULL, &ov);
+	auto rc = GetOverlappedResult(hFile, &ov, &bytes_read, true);
+	if (rc == 0) {
+		auto error = GetLastErrorAsString();
+		throw IOException("Could not read file \"%s\": %s", handle.path, error);
+	}
+	pos += bytes_read;
+	return bytes_read;
+}
+
+void FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
+	DWORD bytes_written;
+	OVERLAPPED ov = {};
+	ov.Internal = 0;
+	ov.InternalHigh = 0;
+	ov.Offset = location & 0xFFFFFFFF;
+	ov.OffsetHigh = location >> 32;
+	ov.hEvent = 0;
+	WriteFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+	auto rc = GetOverlappedResult(hFile, &ov, &bytes_written, true);
 	if (rc == 0) {
 		auto error = GetLastErrorAsString();
 		throw IOException("Could not write file \"%s\": %s", handle.path, error);
 	}
-	return bytes_read;
+	if (bytes_written != nr_bytes) {
+		throw IOException("Could not write all bytes from file \"%s\": wanted=%lld wrote=%lld", handle.path, nr_bytes,
+		                  bytes_written);
+	}
 }
 
 int64_t FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	HANDLE hFile = ((WindowsFileHandle &)handle).fd;
-	DWORD bytes_read;
-	auto rc = WriteFile(hFile, buffer, (DWORD)nr_bytes, &bytes_read, NULL);
+	DWORD bytes_written;
+	auto &pos = ((WindowsFileHandle &)handle).position;
+	OVERLAPPED ov = {};
+	ov.Internal = 0;
+	ov.InternalHigh = 0;
+	ov.Offset = pos & 0xFFFFFFFF;
+	ov.OffsetHigh = pos >> 32;
+	ov.hEvent = 0;
+	WriteFile(hFile, buffer, (DWORD)nr_bytes, NULL, &ov);
+	auto rc = GetOverlappedResult(hFile, &ov, &bytes_written, true);
 	if (rc == 0) {
 		auto error = GetLastErrorAsString();
 		throw IOException("Could not write file \"%s\": %s", handle.path, error);
 	}
-	return bytes_read;
+	pos += bytes_written;
+	return bytes_written;
 }
 
 int64_t FileSystem::GetFileSize(FileHandle &handle) {
@@ -696,6 +794,23 @@ string FileSystem::GetWorkingDirectory() {
 	}
 	return string(buffer.get(), ret);
 }
+
+FileType FileSystem::GetFileType(FileHandle &handle) {
+	auto path = ((WindowsFileHandle &)handle).path;
+	// pipes in windows are just files in '\\.\pipe\' folder
+	if (strncmp(path.c_str(), PIPE_PREFIX, strlen(PIPE_PREFIX)) == 0) {
+		return FileType::FILE_TYPE_FIFO;
+	}
+	DWORD attrs = GetFileAttributesA(path.c_str());
+	if (attrs != INVALID_FILE_ATTRIBUTES) {
+		if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+			return FileType::FILE_TYPE_DIR;
+		} else {
+			return FileType::FILE_TYPE_REGULAR;
+		}
+	}
+	return FileType::FILE_TYPE_INVALID;
+}
 #endif
 
 string FileSystem::GetHomeDirectory() {
@@ -704,26 +819,6 @@ string FileSystem::GetHomeDirectory() {
 		return string();
 	}
 	return homedir;
-}
-
-void FileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
-	// seek to the location
-	SetFilePointer(handle, location);
-	// now read from the location
-	int64_t bytes_read = Read(handle, buffer, nr_bytes);
-	if (bytes_read != nr_bytes) {
-		throw IOException("Could not read sufficient bytes from file \"%s\"", handle.path);
-	}
-}
-
-void FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
-	// seek to the location
-	SetFilePointer(handle, location);
-	// now write to the location
-	int64_t bytes_written = Write(handle, buffer, nr_bytes);
-	if (bytes_written != nr_bytes) {
-		throw IOException("Could not write sufficient bytes from file \"%s\"", handle.path);
-	}
 }
 
 bool FileSystem::CanSeek() {
@@ -840,6 +935,10 @@ void FileHandle::Sync() {
 
 void FileHandle::Truncate(int64_t new_size) {
 	file_system.Truncate(*this, new_size);
+}
+
+FileType FileHandle::GetType() {
+	return file_system.GetFileType(*this);
 }
 
 static bool HasGlob(const string &str) {
@@ -973,7 +1072,9 @@ unique_ptr<FileHandle> VirtualFileSystem::OpenFile(const string &path, uint8_t f
 	}
 	// open the base file handle
 	auto file_handle = FindFileSystem(path)->OpenFile(path, flags, lock, FileCompressionType::UNCOMPRESSED);
-	if (compression != FileCompressionType::UNCOMPRESSED) {
+	if (file_handle->GetType() == FileType::FILE_TYPE_FIFO) {
+		file_handle = PipeFileSystem::OpenPipe(move(file_handle));
+	} else if (compression != FileCompressionType::UNCOMPRESSED) {
 		switch (compression) {
 		case FileCompressionType::GZIP:
 			file_handle = GZipFileSystem::OpenCompressedFile(move(file_handle));

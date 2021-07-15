@@ -26,8 +26,8 @@ struct IndexLock;
 //! The index is an abstract base class that serves as the basis for indexes
 class Index {
 public:
-	Index(IndexType type, const vector<column_t> &column_ids,
-	      const vector<unique_ptr<Expression>> &unbound_expressions);
+	Index(IndexType type, const vector<column_t> &column_ids, const vector<unique_ptr<Expression>> &unbound_expressions,
+	      bool is_unique, bool is_primary);
 	virtual ~Index() = default;
 
 	//! The type of the index
@@ -42,6 +42,10 @@ public:
 	vector<PhysicalType> types;
 	//! The logical types of the expressions
 	vector<LogicalType> logical_types;
+	//! Whether or not the index is an index built to enforce a UNIQUE or PRIMARY KEY constraint
+	bool is_unique;
+	//! Whether or not the index is an index built to enforce a PRIMARY KEY constraint
+	bool is_primary;
 
 public:
 	//! Initialize a scan on the index with the given expression and column ids
@@ -64,8 +68,7 @@ public:
 	virtual bool Append(IndexLock &state, DataChunk &entries, Vector &row_identifiers) = 0;
 	bool Append(DataChunk &entries, Vector &row_identifiers);
 	//! Verify that data can be appended to the index
-	virtual void VerifyAppend(DataChunk &chunk) {
-	}
+	virtual void VerifyAppend(DataChunk &chunk) = 0;
 
 	//! Called when data inside the index is Deleted
 	virtual void Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) = 0;

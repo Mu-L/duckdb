@@ -20,10 +20,8 @@ unique_ptr<Expression> BoundCastExpression::AddCastToType(unique_ptr<Expression>
 	} else if (expr->return_type != target_type) {
 		auto &expr_type = expr->return_type;
 		if (target_type.id() == LogicalTypeId::LIST && expr_type.id() == LogicalTypeId::LIST) {
-			D_ASSERT(!target_type.child_types().empty());
-			D_ASSERT(!expr_type.child_types().empty());
-			auto &target_list = target_type.child_types()[0].second;
-			auto &expr_list = expr_type.child_types()[0].second;
+			auto &target_list = ListType::GetChildType(target_type);
+			auto &expr_list = ListType::GetChildType(expr_type);
 			if (target_list.id() == LogicalTypeId::ANY || expr_list == target_list) {
 				return expr;
 			}
@@ -42,6 +40,22 @@ bool BoundCastExpression::CastIsInvertible(const LogicalType &source_type, const
 	}
 	if (source_type.id() == LogicalTypeId::DOUBLE || target_type.id() == LogicalTypeId::DOUBLE) {
 		return false;
+	}
+	if (source_type.id() == LogicalTypeId::DECIMAL || target_type.id() == LogicalTypeId::DECIMAL) {
+		uint8_t source_width, target_width;
+		uint8_t source_scale, target_scale;
+		// cast to or from decimal
+		// cast is only invertible if the cast is strictly widening
+		if (!source_type.GetDecimalProperties(source_width, source_scale)) {
+			return false;
+		}
+		if (!target_type.GetDecimalProperties(target_width, target_scale)) {
+			return false;
+		}
+		if (target_scale < source_scale) {
+			return false;
+		}
+		return true;
 	}
 	if (source_type.id() == LogicalTypeId::VARCHAR) {
 		return target_type.id() == LogicalTypeId::DATE || target_type.id() == LogicalTypeId::TIMESTAMP ||

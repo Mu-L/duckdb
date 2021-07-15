@@ -37,6 +37,7 @@ void ValidityMask::Combine(const ValidityMask &other, idx_t count) {
 	}
 }
 
+// LCOV_EXCL_START
 string ValidityMask::ToString(idx_t count) const {
 	string result = "Validity Mask (" + to_string(count) + ") [";
 	for (idx_t i = 0; i < count; i++) {
@@ -45,6 +46,7 @@ string ValidityMask::ToString(idx_t count) const {
 	result += "]";
 	return result;
 }
+// LCOV_EXCL_STOP
 
 void ValidityMask::Resize(idx_t old_size, idx_t new_size) {
 	if (validity_mask) {

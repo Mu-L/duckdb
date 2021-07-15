@@ -98,7 +98,6 @@ unique_ptr<BaseStatistics> SumPropagateStats(ClientContext &context, BoundAggreg
 			max_positive = numeric_stats.max.GetValueUnsafe<int64_t>();
 			break;
 		default:
-			// unhandled type here
 			throw InternalException("Unsupported type for propagate sum stats");
 		}
 		auto max_sum_negative = max_negative * hugeint_t(node_stats->max_cardinality);
@@ -152,7 +151,7 @@ AggregateFunction SumFun::GetSumAggregate(PhysicalType type) {
 		return AggregateFunction::UnaryAggregate<SumState<hugeint_t>, hugeint_t, hugeint_t, HugeintSumOperation>(
 		    LogicalType::HUGEINT, LogicalType::HUGEINT);
 	default:
-		throw NotImplementedException("Unimplemented sum aggregate");
+		throw InternalException("Unimplemented sum aggregate");
 	}
 }
 
@@ -162,15 +161,15 @@ unique_ptr<FunctionData> BindDecimalSum(ClientContext &context, AggregateFunctio
 	function = SumFun::GetSumAggregate(decimal_type.InternalType());
 	function.name = "sum";
 	function.arguments[0] = decimal_type;
-	function.return_type = LogicalType(LogicalTypeId::DECIMAL, Decimal::MAX_WIDTH_DECIMAL, decimal_type.scale());
+	function.return_type = LogicalType::DECIMAL(Decimal::MAX_WIDTH_DECIMAL, DecimalType::GetScale(decimal_type));
 	return nullptr;
 }
 
 void SumFun::RegisterFunction(BuiltinFunctions &set) {
 	AggregateFunctionSet sum("sum");
 	// decimal
-	sum.AddFunction(AggregateFunction({LogicalType::DECIMAL}, LogicalType::DECIMAL, nullptr, nullptr, nullptr, nullptr,
-	                                  nullptr, nullptr, BindDecimalSum));
+	sum.AddFunction(AggregateFunction({LogicalTypeId::DECIMAL}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr,
+	                                  nullptr, nullptr, nullptr, BindDecimalSum));
 	sum.AddFunction(GetSumAggregate(PhysicalType::INT16));
 	sum.AddFunction(GetSumAggregate(PhysicalType::INT32));
 	sum.AddFunction(GetSumAggregate(PhysicalType::INT64));
